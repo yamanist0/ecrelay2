@@ -1,0 +1,50 @@
+{
+  "name": "ecrelay2",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "author": "xx025",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/xx025/ecrelay"
+  },
+  "cloudflare": {
+    "bindings": {
+      "KEY_ENCRYPTION_SECRET": {
+        "description": "Required secret. Generate a long random value, for example `openssl rand -hex 32`. It encrypts recoverable client keys and signs administrator sessions."
+      },
+      "ADMIN_API_KEY": {
+        "description": "Optional if the administration hostname is protected by Cloudflare Access. Otherwise set a long random admin login key."
+      },
+      "NATIVE_EGRESS": {
+        "description": "Required Cloudflare VPC Network binding. Keep the binding name as `NATIVE_EGRESS` and select your own online Tunnel/VPC egress whose public IP can reach `chatgpt.com` and `auth.openai.com`."
+      },
+      "CLOUDFLARE_TUNNEL_ID": {
+        "description": "Required for deployment scripts. Set this to your Cloudflare Tunnel/VPC egress UUID so the generated Wrangler config can bind `NATIVE_EGRESS` without editing `wrangler.jsonc`."
+      }
+    }
+  },
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "frontend:build": "node scripts/build-frontend.mjs",
+    "build": "npm run frontend:build && CLOUDFLARE_TUNNEL_ID=${CLOUDFLARE_TUNNEL_ID:-11111111-1111-4111-8111-111111111111} node scripts/wrangler-with-vpc.mjs deploy --dry-run",
+    "deploy": "npm run frontend:build && node scripts/wrangler-with-vpc.mjs deploy",
+    "dev": "npm run frontend:build && node scripts/wrangler-with-vpc.mjs dev",
+    "dev:remote": "npm run frontend:build && node scripts/wrangler-with-vpc.mjs dev --remote",
+    "test": "vitest run",
+    "typecheck": "tsc -p tsconfig.json && tsc -p frontend/tsconfig.json",
+    "types": "wrangler types",
+    "types:check": "wrangler types --check",
+    "check": "npm run types:check && npm run typecheck && npm test && npm run build"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "esbuild": "^0.25.0",
+    "preact": "^10.27.0",
+    "typescript": "^7.0.2",
+    "vitest": "^4.1.11",
+    "wrangler": "4.127.1"
+  }
+}

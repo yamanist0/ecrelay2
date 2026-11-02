@@ -1,0 +1,1077 @@
+import { describe, expect, it, vi } from "vitest";
+import {
+  AccountPoolCore,
+  AccountRecord,
+  PoolState,
+  parseImportPayload,
+} from "../src/pool";
+
+class MemoryStorage {
+  value?: PoolState;
+  async get() {
+    return this.value ? structuredClone(this.value) : undefined;
+  }
+  async put(value: PoolState) {
+    this.value = structuredClone(value);
+  }
+}
+
+const credential = (
+  accountId: string,
+  name?: string,
+  principalId = `user-${accountId}`,
+) => ({
+  name,
+  accessToken: `access-${accountId}`,
+  refreshToken: `refresh-${accountId}`,
+  expiresAt: 10_000_000,
+  accountId,
+  principalId,
+});
+
+const usageSnapshot = (remainingPercent: number) => ({
+  primary: {
+    usedPercent: 100 - remainingPercent,
+    remainingPercent,
+    windowSeconds: 18_000,
+    windowMinutes: 300,
+    resetsAt: 10_000,
+  },
+  secondary: {
+    usedPercent: 100 - remainingPercent,
+    remainingPercent,
+    windowSeconds: 604_800,
+    windowMinutes: 10_080,
+    resetsAt: 20_000,
+  },
+  capturedAt: 1_000,
+});
+
+function jwt(payload: Record<string, unknown>): string {
+  const encode = (value: unknown) =>
+    Buffer.from(JSON.stringify(value)).toString("base64url");
+  return `${encode({ alg: "none" })}.${encode(payload)}.signature`;
+}
+
+describe("AccountPoolCore", () => {
+  it("discovers, encrypts, lists, and selects custom OpenAI APIs", async () => {
+    const storage = new MemoryStorage();
+    const upstream = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) => Response.json({
+      object: "list",
+      data: [
+        { id: "custom-model", owned_by: "vendor" },
+        { id: "custom-model" },
+        { id: "other-model", name: "Other" },
+      ],
+    }));
+    const pool = new AccountPoolCore(storage, upstream as typeof fetch, () => 1_000, "secret");
+    const added = await pool.addCustomApi({
+      name: "Custom",
+      baseUrl: "https://chatgpt.com/proxy/",
+      apiKey: "upstream-secret",
+      priority: 5,
+      fallback: true,
+    });
+    expect(added).toMatchObject({
+      name: "Custom",
+      baseUrl: "https://chatgpt.com/proxy/v1",
+      priority: 5,
+      fallback: true,
+      models: [{ id: "custom-model", ownedBy: "vendor" }, { id: "other-model", name: "Other" }],
+      enabledModelIds: ["custom-model", "other-model"],
+      hasApiKey: true,
+    });
+    expect(added).not.toHaveProperty("encryptedApiKey");
+    expect(JSON.stringify(storage.value)).not.toContain("upstream-secret");
+    const discovery = upstream.mock.calls[0];
+    expect(discovery[0]).toBe("https://chatgpt.com/proxy/v1/models");
+    expect(discovery[1]).toMatchObject({ method: "GET", redirect: "manual" });
+    expect(new Headers(discovery[1]?.headers).get("authorization")).toBe("Bearer upstream-secret");
+
+    expect(await pool.selectCustomApis("custom-model")).toEqual([expect.objectContaining({
+      id: added.id,
+      apiKey: "upstream-secret",
+      baseUrl: "https://chatgpt.com/proxy/v1",
+    })]);
+    expect(await pool.selectCustomApis("missing")).toEqual([]);
+    const filtered = await pool.updateCustomApi(added.id, { enabledModelIds: ["other-model"] });
+    expect(filtered.enabledModelIds).toEqual(["other-model"]);
+    expect(await pool.selectCustomApis("custom-model")).toEqual([]);
+    expect(await pool.selectCustomApis("other-model")).toHaveLength(1);
+    await expect(pool.updateCustomApi(added.id, { enabledModelIds: ["unknown"] }))
+      .rejects.toThrow("unknown model");
+    await pool.updateCustomApi(added.id, { enabled: false });
+    expect(await pool.selectCustomApis("custom-model")).toEqual([]);
+    await pool.removeCustomApi(added.id);
+    expect(await pool.listCustomApis()).toEqual([]);
+  });
+
+  it("treats all models on legacy custom APIs as enabled", async () => {
+    const storage = new MemoryStorage();
+    const upstream = vi.fn(async (_input: RequestInfo | URL) => Response.json({ data: [{ id: "legacy-model" }] }));
+    const pool = new AccountPoolCore(storage, upstream as typeof fetch, () => 1_000, "secret");
+    await pool.addCustomApi({ name: "Legacy", baseUrl: "https://example.com/v1", apiKey: "secret" });
+    delete storage.value!.customApis![0].enabledModelIds;
+
+    expect((await pool.listCustomApis())[0].enabledModelIds).toEqual(["legacy-model"]);
+    expect(await pool.selectCustomApis("legacy-model")).toHaveLength(1);
+  });
+
+  it("rejects invalid custom API model catalogs", async () => {
+    const pool = new AccountPoolCore(
+      new MemoryStorage(),
+      vi.fn(async () => Response.json({ data: [] })) as typeof fetch,
+    );
+    await expect(pool.addCustomApi({
+      name: "Custom",
+      baseUrl: "http://localhost:8080",
+      apiKey: "secret",
+    })).rejects.toThrow("HTTPS URL on port 443");
+    await expect(pool.addCustomApi({
+      name: "Custom",
+      baseUrl: "https://chatgpt.com/v1",
+      apiKey: "secret",
+    })).rejects.toThrow("invalid model catalog");
+  });
+
+  it.each([
+    "https://openrouter.ai/api/v1/chat/completions",
+    "https://openrouter.ai/api/v1/responses/",
+    "https://openrouter.ai/api/v1/models",
+  ])("accepts a full custom API endpoint URL: %s", async (baseUrl) => {
+    const upstream = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) => Response.json({ data: [{ id: "test-model" }] }));
+    const pool = new AccountPoolCore(new MemoryStorage(), upstream as typeof fetch, () => 1_000, "secret");
+
+    const added = await pool.addCustomApi({ name: "OpenRouter", baseUrl, apiKey: "secret" });
+
+    expect(added.baseUrl).toBe("https://openrouter.ai/api/v1");
+    expect(upstream.mock.calls[0][0]).toBe("https://openrouter.ai/api/v1/models");
+  });
+
+  it("refreshes Antigravity quota from daily fetchAvailableModels", async () => {
+    const storage = new MemoryStorage();
+    storage.value = {
+      cursor: 0,
+      accounts: [{
+        provider: "antigravity",
+        id: "ag",
+        name: "Antigravity",
+        enabled: true,
+        accessToken: "access",
+        refreshToken: "refresh",
+        expiresAt: 10_000_000,
+        projectId: "project-id",
+        email: "user@example.com",
+        principalId: "google-id",
+        createdAt: 1,
+        updatedAt: 1,
+        cooldownUntil: 0,
+        failureCount: 0,
+      }],
+    };
+    const fetcher = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      expect(String(input)).toBe("https://daily-cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels");
+      expect(new Headers(init?.headers).get("user-agent")).toBe("antigravity/hub/2.9.1 darwin/arm64");
+      expect(JSON.parse(String(init?.body))).toEqual({ project: "project-id" });
+      return Response.json({
+        models: {
+          "gemini-3-pro": { quotaInfo: { remainingFraction: 0.42, resetTime: "2026-09-04T00:00:00Z" } },
+          ignored: {},
+        },
+      });
+    });
+    const [account] = await new AccountPoolCore(storage, fetcher, () => 1_000).refreshUsage();
+    expect(account.provider).toBe("antigravity");
+    expect(account.projectId).toBe("project-id");
+    expect(account.usage?.geminiModels).toEqual([
+      expect.objectContaining({ modelId: "gemini-3-pro", remainingPercent: 42 }),
+    ]);
+    expect(account).not.toHaveProperty("accessToken");
+    expect(account).not.toHaveProperty("refreshToken");
+    await expect(new AccountPoolCore(storage, fetcher).reset("ag"))
+      .rejects.toMatchObject({ status: 409 });
+  });
+
+  it("dispatches Antigravity refresh and retains its refresh token", async () => {
+    const storage = new MemoryStorage();
+    storage.value = {
+      cursor: 0,
+      accounts: [{
+        provider: "antigravity", id: "ag", name: "AG", enabled: true,
+        accessToken: "old-access", refreshToken: "keep-refresh", expiresAt: 0,
+        projectId: "project-id", principalId: "user", createdAt: 1, updatedAt: 1,
+        cooldownUntil: 0, failureCount: 0,
+      }],
+    };
+    const fetcher = vi
+      .fn()
+      .mockResolvedValueOnce(Response.json({ access_token: "new-access", expires_in: 3600 }))
+      .mockResolvedValueOnce(Response.json({
+        models: { model: { quotaInfo: { remainingFraction: 0.9 } } },
+      }));
+    await new AccountPoolCore(storage, fetcher as unknown as typeof fetch, () => 1_000).refreshUsage();
+    expect(String(fetcher.mock.calls[0][0])).toBe("https://oauth2.googleapis.com/token");
+    expect(String(fetcher.mock.calls[1][0])).toContain("daily-cloudcode-pa.googleapis.com");
+    expect(storage.value?.accounts[0]).toMatchObject({
+      accessToken: "new-access",
+      refreshToken: "keep-refresh",
+    });
+  });
+
+  it("persists validated routing and cooldown settings", async () => {
+    const storage = new MemoryStorage();
+    const pool = new AccountPoolCore(storage);
+    expect(await pool.getSettings()).toMatchObject({
+      selectionStrategy: "round_robin",
+      serviceTier: "standard",
+      maxAccountAttempts: 3,
+      tokenExpiryBufferMinutes: 60,
+    });
+
+    const settings = await pool.updateSettings({
+      selectionStrategy: "least_failures",
+      maxAccountAttempts: 5,
+      tokenExpiryBufferMinutes: 30,
+      rateLimitCooldownSeconds: 90,
+      authCooldownSeconds: 600,
+      serverErrorCooldownSeconds: 25,
+      autoResetExhaustedAccounts: true,
+      serviceTier: "fast",
+    });
+    expect(settings).toMatchObject({
+      selectionStrategy: "least_failures",
+      serviceTier: "fast",
+      maxAccountAttempts: 5,
+      autoResetExhaustedAccounts: true,
+    });
+    expect(await new AccountPoolCore(storage).getSettings()).toEqual(settings);
+    await expect(
+      pool.updateSettings({ maxAccountAttempts: 11 }),
+    ).rejects.toMatchObject({ status: 400 });
+    await expect(
+      pool.updateSettings({ autoResetExhaustedAccounts: "yes" }),
+    ).rejects.toMatchObject({ status: 400 });
+    await expect(
+      pool.updateSettings({ serviceTier: "priority" }),
+    ).rejects.toMatchObject({ status: 400 });
+  });
+
+  it("aggregates request and token usage by model while bounding recent records", async () => {
+    const storage = new MemoryStorage();
+    let now = 1_000;
+    const pool = new AccountPoolCore(storage, vi.fn(), () => now++);
+    await pool.recordRequest({
+      model: "gpt-5.6-sol",
+      endpoint: "/v1/responses",
+      status: 200,
+      durationMs: 125.4,
+      streaming: true,
+      accountId: "internal-account-id",
+      usage: {
+        inputTokens: 10,
+        outputTokens: 5,
+        totalTokens: 15,
+        cachedTokens: 3,
+        available: true,
+      },
+    });
+    await pool.recordRequest({
+      model: "gpt-5.6-sol",
+      endpoint: "/v1/responses",
+      status: 429,
+      durationMs: 20,
+      streaming: false,
+      usage: {
+        inputTokens: 0,
+        outputTokens: 0,
+        totalTokens: 0,
+        cachedTokens: 0,
+        available: false,
+      },
+    });
+
+    const snapshot = await pool.requestStats();
+    expect(snapshot.totals).toMatchObject({
+      requests: 2,
+      successfulRequests: 1,
+      failedRequests: 1,
+      inputTokens: 10,
+      outputTokens: 5,
+      totalTokens: 15,
+      cachedTokens: 3,
+      meteredRequests: 1,
+    });
+    expect(snapshot.models).toMatchObject([
+      { model: "gpt-5.6-sol", requests: 2, totalTokens: 15 },
+    ]);
+    expect(snapshot.recent).toHaveLength(2);
+    expect(snapshot.recent[0]).toMatchObject({ status: 429, durationMs: 20 });
+
+    for (let index = 0; index < 205; index += 1) {
+      await pool.recordRequest({
+        model: "gpt-5.6-terra",
+        endpoint: "/v1/responses",
+        status: 200,
+        durationMs: 1,
+        streaming: false,
+        usage: {
+          inputTokens: 1,
+          outputTokens: 1,
+          totalTokens: 2,
+          cachedTokens: 0,
+          available: true,
+        },
+      });
+    }
+    const bounded = await pool.requestStats();
+    expect(bounded.recent).toHaveLength(200);
+    expect(bounded.retentionLimit).toBe(200);
+    expect(
+      bounded.models.find((model) => model.model === "gpt-5.6-terra")?.requests,
+    ).toBe(205);
+  });
+
+  it("rejects invalid request record metadata", async () => {
+    const pool = new AccountPoolCore(new MemoryStorage());
+    await expect(
+      pool.recordRequest({
+        model: "x".repeat(161),
+        endpoint: "/v1/responses",
+        status: 200,
+        durationMs: 1,
+        streaming: false,
+        usage: {
+          inputTokens: 0,
+          outputTokens: 0,
+          totalTokens: 0,
+          cachedTokens: 0,
+          available: false,
+        },
+      }),
+    ).rejects.toMatchObject({ status: 400 });
+  });
+
+  it("imports, persists, and never lists tokens", async () => {
+    const storage = new MemoryStorage();
+    const upstream = vi.fn(async () =>
+      Response.json({ cloudaicompanionProject: "project" }),
+    );
+    const pool = new AccountPoolCore(storage, upstream as typeof fetch, () => 1_000);
+    await pool.importAccount(credential("a", "Primary"));
+    const listed = await pool.list();
+    expect(listed).toHaveLength(1);
+    expect(listed[0]).toMatchObject({
+      provider: "codex",
+      name: "Primary",
+      accountId: "a",
+      enabled: true,
+    });
+    expect(listed[0]).not.toHaveProperty("accessToken");
+    expect(listed[0]).not.toHaveProperty("refreshToken");
+    expect((await new AccountPoolCore(storage).list())[0].accountId).toBe("a");
+  });
+
+  it("filters selection by provider and defaults legacy records to Codex", async () => {
+    const storage = new MemoryStorage();
+    const legacy = {
+      ...credential("legacy"),
+      id: "legacy-id",
+      name: "Legacy",
+      enabled: true,
+      createdAt: 1,
+      updatedAt: 1,
+      cooldownUntil: 0,
+      failureCount: 0,
+    } as AccountRecord;
+    storage.value = { accounts: [legacy], cursor: 0 };
+    const upstream = vi.fn(async () =>
+      Response.json({ id: "google-user", email: "user@example.com" }),
+    );
+    const pool = new AccountPoolCore(
+      storage,
+      upstream as typeof fetch,
+      () => 1_000,
+    );
+    await pool.importAccount({
+      provider: "antigravity",
+      accessToken: "google-access",
+      refreshToken: "google-refresh",
+      expiresAt: 10_000_000,
+      projectId: "project",
+      email: "user@example.com",
+      principalId: "google-user",
+    });
+
+    expect((await pool.select()).id).toBe("legacy-id");
+    expect((await pool.select([], "antigravity")).projectId).toBe("project");
+    expect((await pool.list())[0].provider).toBe("codex");
+  });
+
+  it("uses Antigravity quota for weighted selection without automatic reset", async () => {
+    const storage = new MemoryStorage();
+    const upstream = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const project = JSON.parse(String(init?.body)).project;
+      const remainingFraction = project === "high-project" ? 0.9 : 0.1;
+      return Response.json({
+        models: {
+          "gemini-2.5-pro": { quotaInfo: { remainingFraction, resetTime: "2026-09-03T05:00:00Z" } },
+        },
+      });
+    });
+    const pool = new AccountPoolCore(storage, upstream as typeof fetch, () => 3_600_000);
+    for (const projectId of ["low-project", "high-project"]) {
+      await pool.importAccount({
+        provider: "antigravity", accessToken: `access-${projectId}`, refreshToken: "refresh",
+        expiresAt: 10_000_000, projectId, principalId: projectId, email: `${projectId}@example.com`,
+      });
+    }
+    await pool.updateSettings({ selectionStrategy: "quota_weighted", autoResetExhaustedAccounts: true });
+
+    expect((await pool.select([], "antigravity")).projectId).toBe("high-project");
+    expect(upstream.mock.calls.map((call) => String(call[0]))).not.toContain(
+      "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits/consume",
+    );
+  });
+
+  it("round-robins enabled healthy accounts", async () => {
+    const storage = new MemoryStorage();
+    const pool = new AccountPoolCore(storage, vi.fn(), () => 1_000);
+    const first = await pool.importAccount(credential("a"));
+    await pool.importAccount(credential("b"));
+    expect((await pool.select()).accountId).toBe("a");
+    expect((await pool.select()).accountId).toBe("b");
+    await pool.update(first.id, { enabled: false });
+    expect((await pool.select()).accountId).toBe("b");
+  });
+
+  it("prefers accounts with more remaining quota when configured", async () => {
+    const storage = new MemoryStorage();
+    const pool = new AccountPoolCore(storage, vi.fn(), () => 1_000);
+    await pool.importAccount(credential("low", "Low"));
+    await pool.importAccount(credential("high", "High"));
+    await pool.updateSettings({ selectionStrategy: "quota_weighted" });
+    storage.value!.accounts[0].usage = usageSnapshot(15);
+    storage.value!.accounts[1].usage = usageSnapshot(80);
+
+    expect((await pool.select()).accountId).toBe("high");
+  });
+
+  it("refreshes stale quota snapshots before quota-weighted selection", async () => {
+    const storage = new MemoryStorage();
+    const oauthFetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const accountId = new Headers(init?.headers).get("chatgpt-account-id");
+      if (String(input).includes("rate-limit-reset-credits")) return Response.json({ available_count: 0 });
+      const used = accountId === "high" ? 20 : 90;
+      return Response.json({
+        rate_limit: {
+          primary_window: { used_percent: used, limit_window_seconds: 18_000, reset_at: 10_000 },
+          secondary_window: { used_percent: used, limit_window_seconds: 604_800, reset_at: 20_000 },
+        },
+      });
+    });
+    const pool = new AccountPoolCore(storage, oauthFetch as typeof fetch, () => 3_600_000);
+    await pool.importAccount(credential("low", "Low"));
+    await pool.importAccount(credential("high", "High"));
+    await pool.updateSettings({ selectionStrategy: "quota_weighted" });
+    storage.value!.accounts[0].usage = { ...usageSnapshot(80), capturedAt: 1_000 };
+    storage.value!.accounts[1].usage = { ...usageSnapshot(10), capturedAt: 1_000 };
+
+    expect((await pool.select()).accountId).toBe("high");
+    expect(oauthFetch).toHaveBeenCalledTimes(4);
+  });
+
+  it("keeps different users in the same Team workspace as separate accounts", async () => {
+    const storage = new MemoryStorage();
+    const pool = new AccountPoolCore(storage, vi.fn(), () => 1_000);
+    const first = await pool.importAccount({
+      ...credential("team", "Alice", "user-alice"),
+      email: "alice@example.com",
+    });
+    const second = await pool.importAccount({
+      ...credential("team", "Bob", "user-bob"),
+      email: "bob@example.com",
+    });
+
+    expect(await pool.list()).toMatchObject([
+      {
+        id: first.id,
+        accountId: "team",
+        principalId: "user-alice",
+        email: "alice@example.com",
+      },
+      {
+        id: second.id,
+        accountId: "team",
+        principalId: "user-bob",
+        email: "bob@example.com",
+      },
+    ]);
+    expect((await pool.select()).principalId).toBe("user-alice");
+    expect((await pool.select()).principalId).toBe("user-bob");
+  });
+
+  it("updates only the matching workspace and user identity on re-import", async () => {
+    const storage = new MemoryStorage();
+    const pool = new AccountPoolCore(storage, vi.fn(), () => 1_000);
+    const alice = await pool.importAccount({
+      ...credential("team", "Alice", "user-alice"),
+      email: "alice@example.com",
+    });
+    await pool.importAccount({
+      ...credential("team", "Bob", "user-bob"),
+      email: "bob@example.com",
+    });
+    const updated = await pool.importAccount({
+      ...credential("team", "Alice Updated", "user-alice"),
+      email: "ALICE@EXAMPLE.COM",
+      accessToken: "rotated-access",
+    });
+
+    expect(updated.id).toBe(alice.id);
+    expect(await pool.list()).toHaveLength(2);
+    expect(
+      storage.value?.accounts.find((account) => account.id === alice.id)
+        ?.accessToken,
+    ).toBe("rotated-access");
+    expect(
+      storage.value?.accounts.find(
+        (account) => account.principalId === "user-bob",
+      )?.name,
+    ).toBe("Bob");
+  });
+
+  it("rejects imports that do not contain a stable user identity", async () => {
+    const pool = new AccountPoolCore(new MemoryStorage(), vi.fn(), () => 1_000);
+    await expect(
+      pool.importAccount({
+        accessToken: "access",
+        refreshToken: "refresh",
+        expiresAt: 10_000,
+        accountId: "team",
+        principalId: "",
+      }),
+    ).rejects.toMatchObject({ status: 400 });
+  });
+
+  it("refreshes expiring credentials and persists rotated refresh tokens", async () => {
+    const storage = new MemoryStorage();
+    const oauthFetch = vi.fn(async () =>
+      Response.json({
+        access_token: "new-access",
+        refresh_token: "new-refresh",
+        expires_in: 7200,
+      }),
+    );
+    const pool = new AccountPoolCore(
+      storage,
+      oauthFetch as typeof fetch,
+      () => 1_000_000,
+    );
+    await pool.importAccount({ ...credential("a"), expiresAt: 1_000_001 });
+    const selected = await pool.select();
+    expect(selected.accessToken).toBe("new-access");
+    expect(selected.refreshToken).toBe("new-refresh");
+    expect(oauthFetch).toHaveBeenCalledTimes(1);
+    expect(storage.value?.accounts[0].refreshToken).toBe("new-refresh");
+  });
+
+  it("refreshes and persists redacted quota snapshots for each enabled account", async () => {
+    const storage = new MemoryStorage();
+    const usageFetch = vi.fn(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        const headers = new Headers(init?.headers);
+        expect(headers.get("authorization")).toBe("Bearer access-a");
+        expect(headers.get("chatgpt-account-id")).toBe("a");
+        if (String(input).endsWith("/rate-limit-reset-credits")) {
+          return Response.json({ available_count: 3 });
+        }
+        expect(String(input)).toBe(
+          "https://chatgpt.com/backend-api/wham/usage",
+        );
+        return Response.json({
+          rate_limit: {
+            primary_window: {
+              used_percent: 25,
+              limit_window_seconds: 18_000,
+              reset_at: 2_000,
+            },
+            secondary_window: {
+              used_percent: 80,
+              limit_window_seconds: 604_800,
+              reset_at: 3_000,
+            },
+          },
+          credits: { balance: 12.5 },
+        });
+      },
+    );
+    const pool = new AccountPoolCore(
+      storage,
+      usageFetch as typeof fetch,
+      () => 1_000,
+    );
+    await pool.importAccount(credential("a", "Primary"));
+
+    const [account] = await pool.refreshUsage();
+
+    expect(account.usage).toEqual({
+      primary: {
+        usedPercent: 25,
+        remainingPercent: 75,
+        windowSeconds: 18_000,
+        windowMinutes: 300,
+        resetsAt: 2_000,
+      },
+      secondary: {
+        usedPercent: 80,
+        remainingPercent: 20,
+        windowSeconds: 604_800,
+        windowMinutes: 10_080,
+        resetsAt: 3_000,
+      },
+      creditsBalance: 12.5,
+      resetCreditsAvailable: 3,
+      capturedAt: 1_000,
+    });
+    expect(account).not.toHaveProperty("accessToken");
+    expect(account).not.toHaveProperty("refreshToken");
+    expect(storage.value?.accounts[0].usage?.primary?.remainingPercent).toBe(
+      75,
+    );
+  });
+
+  it("resets quota with a reset credit and refreshes usage", async () => {
+    const storage = new MemoryStorage();
+    const oauthFetch = vi
+      .fn()
+      .mockResolvedValueOnce(Response.json({ code: "reset", windows_reset: 1 }))
+      .mockResolvedValueOnce(
+        Response.json({
+          rate_limit: {
+            primary_window: {
+              used_percent: 5,
+              limit_window_seconds: 18_000,
+              reset_at: 4_000,
+            },
+          },
+        }),
+      )
+      .mockResolvedValueOnce(Response.json({ available_count: 3 }));
+    const pool = new AccountPoolCore(
+      storage,
+      oauthFetch as unknown as typeof fetch,
+      () => 2_000,
+    );
+    const imported = await pool.importAccount(credential("a", "Primary"));
+
+    const account = await pool.reset(imported.id);
+
+    expect(oauthFetch).toHaveBeenNthCalledWith(
+      1,
+      "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits/consume",
+      expect.objectContaining({ method: "POST" }),
+    );
+    const resetHeaders = new Headers(oauthFetch.mock.calls[0][1]?.headers);
+    expect(resetHeaders.get("authorization")).toBe("Bearer access-a");
+    expect(resetHeaders.get("chatgpt-account-id")).toBe("a");
+    expect(JSON.parse(String(oauthFetch.mock.calls[0][1]?.body))).toMatchObject({
+      redeem_request_id: expect.any(String),
+    });
+    expect(account).toMatchObject({
+      lastResetAt: 2_000,
+      lastResetStatus: "reset",
+      resetCount: 1,
+      failureCount: 0,
+      cooldownUntil: 0,
+      usage: { primary: { remainingPercent: 95 }, resetCreditsAvailable: 3 },
+    });
+    expect(account).not.toHaveProperty("accessToken");
+    expect(account).not.toHaveProperty("refreshToken");
+  });
+
+  it("keeps a confirmed reset successful when usage refresh fails", async () => {
+    const storage = new MemoryStorage();
+    const oauthFetch = vi
+      .fn()
+      .mockResolvedValueOnce(Response.json({ code: "reset", windows_reset: 1 }))
+      .mockResolvedValueOnce(Response.json({ rate_limit: {} }));
+    const pool = new AccountPoolCore(
+      storage,
+      oauthFetch as unknown as typeof fetch,
+      () => 2_000,
+    );
+    const imported = await pool.importAccount(credential("a"));
+
+    const account = await pool.reset(imported.id);
+
+    expect(account).toMatchObject({
+      lastResetAt: 2_000,
+      lastResetStatus: "reset",
+      resetCount: 1,
+      failureCount: 0,
+      cooldownUntil: 0,
+      usage: { capturedAt: 2_000, error: "Usage refresh failed" },
+    });
+    expect(storage.value?.accounts[0]).toMatchObject({
+      lastResetStatus: "reset",
+      resetCount: 1,
+      usage: { capturedAt: 2_000, error: "Usage refresh failed" },
+    });
+    expect(oauthFetch).toHaveBeenCalledTimes(2);
+  });
+
+  it("treats an already redeemed request as a successful reset", async () => {
+    const storage = new MemoryStorage();
+    const oauthFetch = vi
+      .fn()
+      .mockResolvedValueOnce(Response.json({ code: "already_redeemed", windows_reset: 0 }))
+      .mockResolvedValueOnce(Response.json({ rate_limit: {} }));
+    const pool = new AccountPoolCore(
+      storage,
+      oauthFetch as unknown as typeof fetch,
+      () => 2_000,
+    );
+    const imported = await pool.importAccount(credential("a"));
+
+    await expect(pool.reset(imported.id)).resolves.toMatchObject({
+      lastResetStatus: "alreadyRedeemed",
+      resetCount: 1,
+      failureCount: 0,
+      cooldownUntil: 0,
+    });
+  });
+
+  it("rejects manual reset when no reset credit is available", async () => {
+    const storage = new MemoryStorage();
+    const oauthFetch = vi.fn(async () => Response.json({ code: "no_credit", windows_reset: 0 }));
+    const pool = new AccountPoolCore(
+      storage,
+      oauthFetch as unknown as typeof fetch,
+      () => 2_000,
+    );
+    const imported = await pool.importAccount(credential("a"));
+
+    await expect(pool.reset(imported.id)).rejects.toMatchObject({ status: 409 });
+    expect(storage.value?.accounts[0]).toMatchObject({
+      lastResetAt: 2_000,
+      lastResetStatus: "noCredit",
+      failureCount: 1,
+      cooldownUntil: 62_000,
+    });
+  });
+
+  it("auto-resets exhausted accounts when enabled", async () => {
+    const storage = new MemoryStorage();
+    const oauthFetch = vi
+      .fn()
+      .mockResolvedValueOnce(Response.json({ code: "reset", windows_reset: 1 }))
+      .mockResolvedValueOnce(
+        Response.json({
+          rate_limit: {
+            primary_window: {
+              used_percent: 10,
+              limit_window_seconds: 18_000,
+              reset_at: 4_000,
+            },
+          },
+        }),
+      );
+    const pool = new AccountPoolCore(
+      storage,
+      oauthFetch as unknown as typeof fetch,
+      () => 2_000,
+    );
+    await pool.updateSettings({ autoResetExhaustedAccounts: true });
+    const imported = await pool.importAccount(credential("a"));
+    storage.value!.accounts[0].usage = {
+      capturedAt: 1_000,
+      primary: {
+        usedPercent: 100,
+        remainingPercent: 0,
+        windowSeconds: 18_000,
+        windowMinutes: 300,
+        resetsAt: 4_000,
+      },
+    };
+
+    const selected = await pool.select();
+
+    expect(selected.id).toBe(imported.id);
+    expect(selected.usage?.primary?.remainingPercent).toBe(90);
+    expect(oauthFetch).toHaveBeenCalledTimes(3);
+  });
+
+  it("does not repeatedly auto-reset after an exhausted reset attempt", async () => {
+    const storage = new MemoryStorage();
+    const oauthFetch = vi.fn(async () => Response.json({ code: "no_credit", windows_reset: 0 }));
+    const pool = new AccountPoolCore(
+      storage,
+      oauthFetch as unknown as typeof fetch,
+      () => 2_000,
+    );
+    await pool.updateSettings({ autoResetExhaustedAccounts: true });
+    await pool.importAccount(credential("a"));
+    storage.value!.accounts[0].usage = {
+      capturedAt: 1_000,
+      primary: {
+        usedPercent: 100,
+        remainingPercent: 0,
+        windowSeconds: 18_000,
+        windowMinutes: 300,
+        resetsAt: 4_000,
+      },
+    };
+
+    await expect(pool.select()).rejects.toMatchObject({ status: 503 });
+    await expect(pool.select()).rejects.toMatchObject({ status: 503 });
+
+    expect(oauthFetch).toHaveBeenCalledTimes(1);
+    expect(storage.value?.accounts[0]).toMatchObject({
+      lastResetStatus: "noCredit",
+      cooldownUntil: 62_000,
+    });
+  });
+
+  it("cools down rate-limited accounts and fails over", async () => {
+    let now = 1_000;
+    const storage = new MemoryStorage();
+    const pool = new AccountPoolCore(storage, vi.fn(), () => now);
+    const first = await pool.importAccount(credential("a"));
+    await pool.importAccount(credential("b"));
+    expect((await pool.select()).id).toBe(first.id);
+    await pool.report(first.id, 429, 120);
+    expect((await pool.select()).accountId).toBe("b");
+    now += 121_000;
+    expect((await pool.select()).accountId).toBe("a");
+  });
+
+  it("uses configurable cooldowns and can prioritize accounts with fewer failures", async () => {
+    const storage = new MemoryStorage();
+    const pool = new AccountPoolCore(storage, vi.fn(), () => 1_000);
+    const first = await pool.importAccount(credential("a"));
+    const second = await pool.importAccount(credential("b"));
+    await pool.updateSettings({
+      selectionStrategy: "least_failures",
+      rateLimitCooldownSeconds: 120,
+    });
+    await pool.report(first.id, 429);
+    expect(
+      storage.value?.accounts.find((account) => account.id === first.id)
+        ?.cooldownUntil,
+    ).toBe(121_000);
+    expect((await pool.select()).id).toBe(second.id);
+  });
+
+  it("supports enable, disable, rename, and removal", async () => {
+    const storage = new MemoryStorage();
+    const pool = new AccountPoolCore(storage, vi.fn(), () => 1_000);
+    const account = await pool.importAccount(credential("a"));
+    expect(
+      await pool.update(account.id, { enabled: false, name: "Paused" }),
+    ).toMatchObject({ enabled: false, name: "Paused" });
+    await pool.remove(account.id);
+    expect(await pool.list()).toEqual([]);
+  });
+
+  it("creates, reveals, verifies, and revokes multiple encrypted proxy keys", async () => {
+    const storage = new MemoryStorage();
+    const pool = new AccountPoolCore(
+      storage,
+      vi.fn(),
+      () => 1_000,
+      "encryption-secret",
+    );
+    const first = await pool.generateProxyKey("Desktop");
+    const second = await pool.generateProxyKey("Server");
+    expect(first.key).toMatch(/^cp_[0-9a-f]{64}$/);
+    expect(second.key).not.toBe(first.key);
+    expect(await pool.listProxyKeys()).toMatchObject([
+      { name: "Desktop" },
+      { name: "Server" },
+    ]);
+    expect(await pool.revealProxyKey(first.metadata.id)).toBe(first.key);
+    expect(await pool.verifyProxyKey(first.key)).toBe(true);
+    expect(await pool.verifyProxyKey(second.key)).toBe(true);
+    expect(await pool.verifyProxyKey("wrong")).toBe(false);
+    expect(JSON.stringify(storage.value)).not.toContain(first.key);
+    expect(JSON.stringify(storage.value)).not.toContain(second.key);
+
+    await pool.revokeProxyKey(first.metadata.id);
+    expect(await pool.verifyProxyKey(first.key)).toBe(false);
+    expect(await pool.verifyProxyKey(second.key)).toBe(true);
+    expect(await pool.listProxyKeys()).toMatchObject([{ name: "Server" }]);
+    expect(storage.value?.proxyKeys).toHaveLength(1);
+    expect(storage.value?.proxyKeys?.[0].id).toBe(second.metadata.id);
+    await expect(pool.revealProxyKey(first.metadata.id)).rejects.toMatchObject({
+      status: 404,
+    });
+  });
+
+  it("renames active proxy keys", async () => {
+    const storage = new MemoryStorage();
+    const pool = new AccountPoolCore(
+      storage,
+      vi.fn(),
+      () => 1_000,
+      "encryption-secret",
+    );
+    const created = await pool.generateProxyKey("Desktop");
+
+    expect(await pool.renameProxyKey(created.metadata.id, "Laptop")).toMatchObject({
+      id: created.metadata.id,
+      name: "Laptop",
+    });
+    expect(await pool.listProxyKeys()).toMatchObject([{ name: "Laptop" }]);
+  });
+
+  it("automatically removes previously revoked proxy keys when listing", async () => {
+    const storage = new MemoryStorage();
+    const pool = new AccountPoolCore(
+      storage,
+      vi.fn(),
+      () => 2_000,
+      "encryption-secret",
+    );
+    const active = await pool.generateProxyKey("Active");
+    const revoked = await pool.generateProxyKey("Revoked");
+    const revokedRecord = storage.value?.proxyKeys?.find(
+      (record) => record.id === revoked.metadata.id,
+    );
+    if (!revokedRecord) throw new Error("Expected generated proxy key");
+    revokedRecord.revokedAt = 1_000;
+
+    expect(await pool.listProxyKeys()).toMatchObject([
+      { id: active.metadata.id, name: "Active" },
+    ]);
+    expect(storage.value?.proxyKeys).toHaveLength(1);
+    expect(storage.value?.proxyKeys?.[0].id).toBe(active.metadata.id);
+  });
+
+  it("keeps legacy hash-only keys valid and allows revoking them", async () => {
+    const storage = new MemoryStorage();
+    const pool = new AccountPoolCore(storage);
+    const legacy = await pool.generateProxyKey("Temporary");
+    storage.value = {
+      accounts: [],
+      cursor: 0,
+      proxyKeyHash: storage.value?.proxyKeys?.[0].keyHash,
+    };
+    expect(await pool.verifyProxyKey(legacy.key)).toBe(true);
+    expect(await pool.listProxyKeys()).toMatchObject([
+      { id: "legacy", recoverable: false },
+    ]);
+    await expect(pool.revealProxyKey("legacy")).rejects.toMatchObject({
+      status: 410,
+    });
+    await pool.revokeProxyKey("legacy");
+    expect(await pool.verifyProxyKey(legacy.key)).toBe(false);
+    expect(await pool.listProxyKeys()).toEqual([]);
+  });
+});
+
+describe("parseImportPayload", () => {
+  it("defaults imports without a provider to Codex", () => {
+    expect(
+      parseImportPayload({
+        accessToken: "access",
+        refreshToken: "refresh",
+        expiresAt: 1234,
+        accountId: "account",
+        principalId: "user",
+      }).provider,
+    ).toBe("codex");
+  });
+
+  it("accepts Antigravity credentials aliases with an explicit provider", () => {
+    expect(
+      parseImportPayload({
+        provider: "antigravity",
+        accessToken: "access",
+        refreshToken: "refresh",
+        expires_at: 1234,
+        project_id: "project",
+        email: "USER@EXAMPLE.COM",
+      }),
+    ).toMatchObject({
+      provider: "antigravity",
+      accessToken: "access",
+      refreshToken: "refresh",
+      expiresAt: 1234,
+      projectId: "project",
+      email: "user@example.com",
+    });
+  });
+  it("accepts Codex auth.json", () => {
+    const idToken = jwt({
+      email: "Member@Example.com",
+      "https://api.openai.com/auth": {
+        chatgpt_account_id: "account",
+        chatgpt_user_id: "user-member",
+      },
+    });
+    expect(
+      parseImportPayload({
+        tokens: {
+          id_token: idToken,
+          access_token: "access",
+          refresh_token: "refresh",
+          expiresAt: 1234,
+        },
+      }),
+    ).toMatchObject({
+      accessToken: "access",
+      refreshToken: "refresh",
+      accountId: "account",
+      principalId: "user-member",
+      email: "member@example.com",
+      expiresAt: 1234,
+    });
+  });
+
+  it("extracts identity and email from access-token claims when no ID token is present", () => {
+    const accessToken = jwt({
+      exp: 10,
+      "https://api.openai.com/auth": {
+        chatgpt_account_id: "account",
+        user_id: "user-from-access",
+      },
+      "https://api.openai.com/profile": { email: "access@example.com" },
+    });
+    expect(
+      parseImportPayload({
+        tokens: {
+          access_token: accessToken,
+          refresh_token: "refresh",
+        },
+      }),
+    ).toMatchObject({
+      accountId: "account",
+      principalId: "user-from-access",
+      email: "access@example.com",
+      expiresAt: 10_000,
+    });
+  });
+
+  it("prefers a stable ChatGPT user ID over the ID-token subject", () => {
+    const idToken = jwt({ sub: "auth0-subject", email: "member@example.com" });
+    const accessToken = jwt({
+      exp: 10,
+      "https://api.openai.com/auth": {
+        chatgpt_account_id: "team",
+        chatgpt_user_id: "chatgpt-user",
+      },
+    });
+    expect(
+      parseImportPayload({
+        tokens: {
+          id_token: idToken,
+          access_token: accessToken,
+          refresh_token: "refresh",
+        },
+      }),
+    ).toMatchObject({
+      principalId: "chatgpt-user",
+      email: "member@example.com",
+    });
+  });
+});
